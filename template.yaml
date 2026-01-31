@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Canonical Tag Resolver API
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: canonical-tag-resolver
+        POWERTOOLS_LOG_LEVEL: INFO
+        POWERTOOLS_METRICS_NAMESPACE: CanonicalTagResolver
+
+Parameters:
+  AzureOpenAIApiKey:
+    Type: String
+    NoEcho: true
+    Description: Azure OpenAI API Key
+  MeiliMasterKey:
+    Type: String
+    NoEcho: true
+    Description: Meilisearch Master Key
+  MeiliUrl:
+    Type: String
+    Default: https://edge.meilisearch.com
+    Description: Meilisearch URL
+  IndexName:
+    Type: String
+    Default: semantic_topic
+    Description: Meilisearch Index Name
+
+Resources:
+  CanonicalTagsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-canonical-tags"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: canonical_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: canonical_key
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Application
+          Value: CanonicalTagResolver
+
+  CanonicalTagResolverApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET, POST, OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+        AllowOrigin: "'*'"
+
+  SearchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CanonicalTagsTable
+      Events:
+        SearchApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CanonicalTagResolverApi
+            Path: /search
+            Method: POST
+        ResolveApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CanonicalTagResolverApi
+            Path: /resolve
+            Method: POST
+        IngestApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CanonicalTagResolverApi
+            Path: /ingest
+            Method: POST
+        swaggerUi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CanonicalTagResolverApi
+            Path: /swagger
+            Method: GET
+      Environment:
+        Variables:
+          CANONICAL_TAGS_TABLE: !Ref CanonicalTagsTable
+          AZURE_OPEN_AI_API_KEY: !Ref AzureOpenAIApiKey
+          MELI_MASTER_KEY: !Ref MeiliMasterKey
+          MEILI_URL: !Ref MeiliUrl
+          INDEX_NAME: !Ref IndexName
+          LLM_MODEL: gpt-4.1-nano
+          LLM_DEPLOYMENT: gpt-4.1-nano
+          LLM_API_VERSION: 2024-12-01-preview
+          ENDPOINT: https://uksouth.api.cognitive.microsoft.com/
+          EMBEDDING_MODEL: text-embedding-3-large
+          DIMENSIONS: "3072"
+    Metadata:
+      DockerTag: api-v1
+      DockerContext: .
+      Dockerfile: Dockerfile-api
+
+  StreamProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Policies:
+        - DynamoDBStreamReadPolicy:
+            TableName: !Ref CanonicalTagsTable
+            StreamName: !Select [3, !Split ["/", !GetAtt CanonicalTagsTable.StreamArn]]
+      Events:
+        DynamoDBStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt CanonicalTagsTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: canonical-tag-stream-processor
+          POWERTOOLS_LOG_LEVEL: INFO
+          POWERTOOLS_METRICS_NAMESPACE: CanonicalTagStreamProcessor
+          AZURE_OPEN_AI_API_KEY: !Ref AzureOpenAIApiKey
+          MELI_MASTER_KEY: !Ref MeiliMasterKey
+          MEILI_URL: !Ref MeiliUrl
+          INDEX_NAME: !Ref IndexName
+          LLM_MODEL: gpt-4.1-nano
+          LLM_DEPLOYMENT: gpt-4.1-nano
+          LLM_API_VERSION: 2024-12-01-preview
+          ENDPOINT: https://uksouth.api.cognitive.microsoft.com/
+          EMBEDDING_MODEL: text-embedding-3-large
+          DIMENSIONS: "3072"
+    Metadata:
+      DockerTag: stream-processor-v1
+      DockerContext: .
+      Dockerfile: Dockerfile-stream-processor
+
+Outputs:
+  CanonicalTagResolverApiUrl:
+    Description: API Gateway endpoint URL for prod stage
+    Value: !Sub "https://${CanonicalTagResolverApi}.execute-api.${AWS::Region}.amazonaws.com/prod/"
+  CanonicalTagsTableName:
+    Description: DynamoDB table name for canonical tags
+    Value: !Ref CanonicalTagsTable
+  CanonicalTagsTableStreamArn:
+    Description: DynamoDB table stream ARN
+    Value: !GetAtt CanonicalTagsTable.StreamArn
+  SearchFunctionArn:
+    Description: Search Lambda Function ARN
+    Value: !GetAtt SearchFunction.Arn
+  StreamProcessorFunctionArn:
+    Description: Stream Processor Lambda Function ARN
+    Value: !GetAtt StreamProcessorFunction.Arn

@@ -1,0 +1,8 @@
+aws-lambda-powertools>=3.5.0
+boto3>=1.34.0
+langchain>=1.2.7
+langchain-community>=0.4.1
+langchain-openai>=1.1.7
+meilisearch>=0.40.0
+pydantic>=2.12.5
+pydantic-settings>=2.12.0
