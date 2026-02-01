@@ -213,6 +213,8 @@ def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
         )
 
         suggestions = []
+        auto_merged_to = None
+
         for doc, score in search_results:
             llm_review = None
 
@@ -231,6 +233,37 @@ def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
                     value=1,
                 )
 
+                if llm_review.get("can_auto_merge") and auto_merged_to is None:
+                    try:
+                        table.put_item(
+                            Item={
+                                "canonical_key": f"alias#{request.query}",
+                                "maps_to": doc.page_content,
+                                "metadata": {
+                                    "created_by": "auto_merge",
+                                    "similarity_score": float(score),
+                                    "llm_confidence": llm_review.get("confidence"),
+                                    "llm_reasoning": llm_review.get("reasoning"),
+                                },
+                            },
+                        )
+                        auto_merged_to = doc.page_content
+                        logger.info(
+                            f"Auto-merged alias '{request.query}' -> '{doc.page_content}'"
+                        )
+                        metrics.add_metric(
+                            name="AutoMergeCreated",
+                            unit=MetricUnit.Count,
+                            value=1,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to create auto-merge alias: {e}")
+                        metrics.add_metric(
+                            name="AutoMergeErrors",
+                            unit=MetricUnit.Count,
+                            value=1,
+                        )
+
             suggestions.append(
                 CanonicalKeySuggestion(
                     canonical_key=doc.page_content,
@@ -244,9 +277,12 @@ def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
             query=request.query,
             suggestions=suggestions,
             count=len(suggestions),
+            auto_merged_to=auto_merged_to,
         )
 
         logger.info(f"Found {response.count} similar keys")
+        if auto_merged_to:
+            logger.info(f"Auto-merged '{request.query}' to '{auto_merged_to}'")
         metrics.add_metric(name="SimilarKeysFound", unit=MetricUnit.Count, value=1)
         metrics.add_metric(
             name="SuggestionsReturned",

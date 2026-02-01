@@ -82,6 +82,10 @@ class ResolveResponseExact(BaseModel):
     canonical_key: str
     match_type: str = Field(default="exact")
     metadata: dict[str, Any] = Field(default_factory=dict)
+    is_alias: bool = Field(default=False, description="True if the query was an alias")
+    original_query: str | None = Field(
+        default=None, description="Original query if resolved from alias"
+    )
 
 
 class ResolveResponseSuggestions(BaseModel):
@@ -92,6 +96,10 @@ class ResolveResponseSuggestions(BaseModel):
     query: str
     suggestions: list[CanonicalKeySuggestion]
     count: int = Field(..., ge=0)
+    auto_merged_to: str | None = Field(
+        default=None,
+        description="Canonical key that was auto-merged to if LLM approved",
+    )
 
 
 class IngestRequest(BaseModel):
@@ -142,3 +150,103 @@ class ErrorResponse(BaseModel):
 
     error: str
     details: str | None = None
+
+
+class CreateAliasRequest(BaseModel):
+    """Request model for creating an alias mapping."""
+
+    alias: str = Field(..., min_length=1, max_length=500, description="Alias tag name")
+    canonical_key: str = Field(
+        ..., min_length=1, max_length=500, description="Canonical tag to map to"
+    )
+
+    @field_validator("alias", "canonical_key")
+    @classmethod
+    def normalize_tags(cls, v: str) -> str:
+        """Normalize tags to lowercase and strip whitespace."""
+        if not v.strip():
+            raise ValueError("Tag cannot be empty or only whitespace")
+        return v.strip().lower()
+
+
+class CreateAliasesRequest(BaseModel):
+    """Request model for creating multiple alias mappings."""
+
+    aliases: list[dict[str, str]] = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="List of alias mappings with 'alias' and 'canonical_key' fields",
+    )
+
+    @field_validator("aliases")
+    @classmethod
+    def validate_aliases(cls, v: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Validate each alias mapping has required fields."""
+        if not v:
+            raise ValueError("Aliases list cannot be empty")
+
+        for idx, alias_map in enumerate(v):
+            if not isinstance(alias_map, dict):
+                raise ValueError(f"Alias at index {idx} must be a dictionary")
+            if "alias" not in alias_map or "canonical_key" not in alias_map:
+                raise ValueError(
+                    f"Alias at index {idx} must have 'alias' and 'canonical_key' fields"
+                )
+            if not alias_map["alias"].strip() or not alias_map["canonical_key"].strip():
+                raise ValueError(
+                    f"Alias at index {idx} has empty alias or canonical_key"
+                )
+
+        return v
+
+
+class CreateAliasResponse(BaseModel):
+    """Response model for alias creation."""
+
+    message: str
+    alias: str
+    canonical_key: str
+    created: bool = Field(default=True)
+
+
+class CreateAliasesResponse(BaseModel):
+    """Response model for bulk alias creation."""
+
+    message: str
+    created_count: int = Field(..., ge=0)
+    failed_count: int = Field(default=0, ge=0)
+    errors: list[str] = Field(default_factory=list)
+
+
+class DeleteAliasRequest(BaseModel):
+    """Request model for deleting an alias."""
+
+    alias: str = Field(
+        ..., min_length=1, max_length=500, description="Alias tag to delete"
+    )
+
+    @field_validator("alias")
+    @classmethod
+    def normalize_alias(cls, v: str) -> str:
+        """Normalize alias to lowercase and strip whitespace."""
+        if not v.strip():
+            raise ValueError("Alias cannot be empty or only whitespace")
+        return v.strip().lower()
+
+
+class DeleteAliasResponse(BaseModel):
+    """Response model for alias deletion."""
+
+    message: str
+    alias: str
+    deleted: bool = Field(default=True)
+
+
+class ListAliasesResponse(BaseModel):
+    """Response model for listing aliases."""
+
+    aliases: list[dict[str, str]] = Field(
+        default_factory=list, description="List of alias mappings"
+    )
+    count: int = Field(..., ge=0)
