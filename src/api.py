@@ -1,19 +1,32 @@
+from decimal import Decimal
+from functools import lru_cache
 from http import HTTPStatus
 from typing import Any
 
+import boto3
 from aws_lambda_powertools import Logger, Metrics, Tracer
 from aws_lambda_powertools.event_handler import APIGatewayRestResolver, CORSConfig
 from aws_lambda_powertools.logging import correlation_paths
 from aws_lambda_powertools.metrics import MetricUnit
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from botocore.exceptions import ClientError
+from langchain_community.vectorstores import Meilisearch
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from meilisearch import Client as MeiliClient
 
 from src.models import (
     CanonicalKeySuggestion,
+    CreateAliasesRequest,
+    CreateAliasesResponse,
+    CreateAliasRequest,
+    CreateAliasResponse,
+    DeleteAliasRequest,
+    DeleteAliasResponse,
     IngestRequest,
     IngestResponse,
+    ListAliasesResponse,
     ResolveRequest,
     ResolveResponseExact,
     ResolveResponseSuggestions,
@@ -21,12 +34,7 @@ from src.models import (
     SearchResponse,
     SearchResult,
 )
-from src.shared import (
-    get_azure_settings,
-    get_chat_model,
-    get_dynamodb_table,
-    get_vector_store,
-)
+from src.settings import AzureOpenAISettings, DynamoDBSettings, MeilisearchSettings
 
 # Initialize Powertools
 logger = Logger()
@@ -41,6 +49,93 @@ app = APIGatewayRestResolver(
 )
 
 app.enable_swagger()
+
+
+@lru_cache(maxsize=1)
+def get_dynamodb_table():
+    """Get or create DynamoDB table resource (cached)."""
+    dynamodb_settings = get_dynamodb_settings()
+    dynamodb = boto3.resource("dynamodb")
+    return dynamodb.Table(dynamodb_settings.canonical_tags_table)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@lru_cache(maxsize=1)
+def get_azure_settings() -> AzureOpenAISettings:
+    """Get or create Azure OpenAI settings (cached)."""
+    return AzureOpenAISettings()  # pyright: ignore[reportCallIssue]
+
+
+@lru_cache(maxsize=1)
+def get_meili_settings() -> MeilisearchSettings:
+    """Get or create Meilisearch settings (cached)."""
+    return MeilisearchSettings()  # pyright: ignore[reportCallIssue]
+
+
+@lru_cache(maxsize=1)
+def get_dynamodb_settings() -> DynamoDBSettings:
+    """Get or create DynamoDB settings (cached)."""
+    return DynamoDBSettings()  # pyright: ignore[reportCallIssue]
+
+
+@lru_cache(maxsize=1)
+def get_meili_client() -> MeiliClient:
+    """Get or create Meilisearch client (cached)."""
+    meili_settings = get_meili_settings()
+    return MeiliClient(
+        meili_settings.meili_url,
+        meili_settings.meli_master_key.get_secret_value(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_embeddings() -> AzureOpenAIEmbeddings:
+    """Get or create Azure OpenAI embeddings (cached)."""
+    azure_settings = get_azure_settings()
+    return AzureOpenAIEmbeddings(
+        model=azure_settings.embedding_model,
+        azure_endpoint=azure_settings.endpoint,
+        api_key=azure_settings.azure_open_ai_api_key,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_chat_model() -> AzureChatOpenAI:
+    """Get or create Azure OpenAI chat model (cached)."""
+    azure_settings = get_azure_settings()
+    return AzureChatOpenAI(
+        azure_deployment=azure_settings.llm_deployment,
+        azure_endpoint=azure_settings.endpoint,
+        api_key=azure_settings.azure_open_ai_api_key,
+        api_version="2024-02-15-preview",
+        temperature=0,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_vector_store() -> Meilisearch:
+    """Get or create Meilisearch vector store (cached).
+
+    This creates the vector store once with embedders config.
+    The embedders will be set only on first initialization.
+    """
+    meili_settings = get_meili_settings()
+    meili_client = get_meili_client()
+    embeddings = get_embeddings()
+    azure_settings = get_azure_settings()
+
+    embedders = {
+        azure_settings.embedding_model: {
+            "source": "userProvided",
+            "dimensions": azure_settings.dimensions,
+        },
+    }
+
+    return Meilisearch(
+        client=meili_client,
+        index_name=meili_settings.index_name,
+        embedding=embeddings,
+        embedders=embedders,
+    )
 
 
 def review_tag_merge_with_llm(
@@ -179,7 +274,7 @@ def search_topics(request: SearchRequest) -> dict[str, Any]:
 @app.post("/resolve")
 @tracer.capture_method
 def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
-    """Resolve a canonical key. Check DynamoDB first, then suggest similar keys from vector store if not found."""
+    """Resolve a canonical key. Check DynamoDB for exact match or alias, then suggest similar keys from vector store if not found."""
     logger.info(f"Resolving canonical key for: {request.query}")
 
     try:
@@ -197,10 +292,45 @@ def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
                 response = ResolveResponseExact(
                     canonical_key=response_db["Item"]["canonical_key"],
                     metadata=response_db["Item"].get("metadata", {}),
+                    is_alias=False,
                 )
                 return response.model_dump()
         except ClientError as e:
             logger.error(f"Error querying DynamoDB: {e}")
+
+        try:
+            alias_key = f"alias#{request.query}"
+            response_alias = table.get_item(Key={"canonical_key": alias_key})
+            if "Item" in response_alias:
+                canonical_key = response_alias["Item"].get("maps_to")
+                if canonical_key:
+                    logger.info(
+                        f"Found alias mapping: {request.query} -> {canonical_key}",
+                    )
+                    metrics.add_metric(
+                        name="AliasMatchFound",
+                        unit=MetricUnit.Count,
+                        value=1,
+                    )
+
+                    canonical_response = table.get_item(
+                        Key={"canonical_key": canonical_key},
+                    )
+                    metadata = (
+                        canonical_response.get("Item", {}).get("metadata", {})
+                        if "Item" in canonical_response
+                        else {}
+                    )
+
+                    response = ResolveResponseExact(
+                        canonical_key=canonical_key,
+                        metadata=metadata,
+                        is_alias=True,
+                        original_query=request.query,
+                    )
+                    return response.model_dump()
+        except ClientError as e:
+            logger.error(f"Error querying alias in DynamoDB: {e}")
 
         logger.info("No exact match found, searching vector store for similar keys")
         azure_settings = get_azure_settings()
@@ -233,29 +363,48 @@ def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
                     value=1,
                 )
 
+                # Auto-merge if LLM approves and we haven't already merged
                 if llm_review.get("can_auto_merge") and auto_merged_to is None:
                     try:
-                        table.put_item(
-                            Item={
-                                "canonical_key": f"alias#{request.query}",
-                                "maps_to": doc.page_content,
-                                "metadata": {
-                                    "created_by": "auto_merge",
-                                    "similarity_score": float(score),
-                                    "llm_confidence": llm_review.get("confidence"),
-                                    "llm_reasoning": llm_review.get("reasoning"),
+                        alias_key = f"alias#{request.query}"
+                        # Check if alias already exists
+                        existing_alias = table.get_item(
+                            Key={"canonical_key": alias_key}
+                        )
+
+                        if "Item" not in existing_alias:
+                            # Create the alias mapping
+                            table.put_item(
+                                Item={
+                                    "canonical_key": alias_key,
+                                    "maps_to": doc.page_content,
+                                    "metadata": {
+                                        "type": "alias",
+                                        "auto_merged": True,
+                                        "similarity_score": Decimal(str(score)),
+                                        "llm_confidence": llm_review.get("confidence"),
+                                        "llm_reasoning": llm_review.get("reasoning"),
+                                    },
                                 },
-                            },
-                        )
-                        auto_merged_to = doc.page_content
-                        logger.info(
-                            f"Auto-merged alias '{request.query}' -> '{doc.page_content}'"
-                        )
-                        metrics.add_metric(
-                            name="AutoMergeCreated",
-                            unit=MetricUnit.Count,
-                            value=1,
-                        )
+                            )
+                            auto_merged_to = doc.page_content
+                            logger.info(
+                                f"Auto-merged '{request.query}' to '{doc.page_content}' "
+                                f"(score: {score:.3f}, confidence: {llm_review.get('confidence')})"
+                            )
+                            metrics.add_metric(
+                                name="AutoMergesCreated",
+                                unit=MetricUnit.Count,
+                                value=1,
+                            )
+                        else:
+                            # Alias already exists - set auto_merged_to to the existing mapping
+                            existing_maps_to = existing_alias["Item"].get("maps_to")
+                            if existing_maps_to:
+                                auto_merged_to = existing_maps_to
+                            logger.info(
+                                f"Alias '{request.query}' already exists (maps to '{existing_maps_to}'), skipping auto-merge"
+                            )
                     except Exception as e:
                         logger.error(f"Failed to create auto-merge alias: {e}")
                         metrics.add_metric(
@@ -281,8 +430,6 @@ def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
         )
 
         logger.info(f"Found {response.count} similar keys")
-        if auto_merged_to:
-            logger.info(f"Auto-merged '{request.query}' to '{auto_merged_to}'")
         metrics.add_metric(name="SimilarKeysFound", unit=MetricUnit.Count, value=1)
         metrics.add_metric(
             name="SuggestionsReturned",
@@ -295,6 +442,243 @@ def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
     except Exception:
         logger.exception("Error during canonical key resolution")
         metrics.add_metric(name="ResolveErrors", unit=MetricUnit.Count, value=1)
+        raise
+
+
+@app.post("/aliases")
+@tracer.capture_method
+def create_alias(
+    request: CreateAliasRequest,
+) -> dict[str, Any] | tuple[dict[str, Any], HTTPStatus]:
+    """Create an alias mapping to a canonical tag."""
+    logger.info(f"Creating alias: {request.alias} -> {request.canonical_key}")
+
+    try:
+        table = get_dynamodb_table()
+
+        canonical_response = table.get_item(
+            Key={"canonical_key": request.canonical_key},
+        )
+        if "Item" not in canonical_response:
+            logger.warning(f"Canonical key not found: {request.canonical_key}")
+            metrics.add_metric(
+                name="AliasCreationFailed",
+                unit=MetricUnit.Count,
+                value=1,
+            )
+            return {
+                "error": "Canonical key not found",
+                "details": (
+                    f"The canonical key '{request.canonical_key}' does not "
+                    "exist. Please create it first."
+                ),
+            }, HTTPStatus.NOT_FOUND
+
+        alias_check = table.get_item(Key={"canonical_key": request.alias})
+        if "Item" in alias_check:
+            logger.warning(f"Alias {request.alias} already exists as canonical key")
+            metrics.add_metric(
+                name="AliasCreationFailed",
+                unit=MetricUnit.Count,
+                value=1,
+            )
+            return {
+                "error": "Alias conflict",
+                "details": (
+                    f"'{request.alias}' already exists as a canonical key. "
+                    "Cannot create as alias."
+                ),
+            }, HTTPStatus.CONFLICT
+
+        alias_key = f"alias#{request.alias}"
+        table.put_item(
+            Item={
+                "canonical_key": alias_key,
+                "maps_to": request.canonical_key,
+                "metadata": {
+                    "type": "alias",
+                    "created_at": str(
+                        boto3.Session()
+                        .client("sts")
+                        .get_caller_identity()
+                        .get("Account"),
+                    ),
+                },
+            },
+        )
+
+        logger.info(
+            f"Successfully created alias: {request.alias} -> {request.canonical_key}",
+        )
+        metrics.add_metric(name="AliasCreated", unit=MetricUnit.Count, value=1)
+
+        response = CreateAliasResponse(
+            message=f"Alias '{request.alias}' successfully mapped to '{request.canonical_key}'",
+            alias=request.alias,
+            canonical_key=request.canonical_key,
+        )
+        return response.model_dump()
+
+    except Exception:
+        logger.exception("Error creating alias")
+        metrics.add_metric(name="AliasCreationErrors", unit=MetricUnit.Count, value=1)
+        raise
+
+
+@app.post("/aliases/bulk")
+@tracer.capture_method
+def create_aliases_bulk(request: CreateAliasesRequest) -> dict[str, Any]:
+    """Create multiple alias mappings in bulk."""
+    logger.info(f"Creating {len(request.aliases)} aliases in bulk")
+
+    try:
+        table = get_dynamodb_table()
+        created_count = 0
+        failed_count = 0
+        errors = []
+
+        with table.batch_writer() as batch:
+            for idx, alias_map in enumerate(request.aliases):
+                try:
+                    alias = alias_map["alias"].strip().lower()
+                    canonical_key = alias_map["canonical_key"].strip().lower()
+
+                    canonical_response = table.get_item(
+                        Key={"canonical_key": canonical_key},
+                    )
+                    if "Item" not in canonical_response:
+                        errors.append(
+                            f"Index {idx}: Canonical key '{canonical_key}' not found",
+                        )
+                        failed_count += 1
+                        continue
+
+                    alias_key = f"alias#{alias}"
+                    batch.put_item(
+                        Item={
+                            "canonical_key": alias_key,
+                            "maps_to": canonical_key,
+                            "metadata": {"type": "alias"},
+                        },
+                    )
+                    created_count += 1
+
+                except Exception as e:
+                    errors.append(f"Index {idx}: {e!s}")
+                    failed_count += 1
+
+        logger.info(
+            f"Bulk alias creation complete. Created: {created_count}, Failed: {failed_count}",
+        )
+        metrics.add_metric(
+            name="BulkAliasesCreated",
+            unit=MetricUnit.Count,
+            value=created_count,
+        )
+        metrics.add_metric(
+            name="BulkAliasesFailed",
+            unit=MetricUnit.Count,
+            value=failed_count,
+        )
+
+        response = CreateAliasesResponse(
+            message=f"Created {created_count} aliases, {failed_count} failed",
+            created_count=created_count,
+            failed_count=failed_count,
+            errors=errors,
+        )
+        return response.model_dump()
+
+    except Exception:
+        logger.exception("Error creating aliases in bulk")
+        metrics.add_metric(
+            name="BulkAliasCreationErrors",
+            unit=MetricUnit.Count,
+            value=1,
+        )
+        raise
+
+
+@app.delete("/aliases")
+@tracer.capture_method
+def delete_alias(
+    request: DeleteAliasRequest,
+) -> dict[str, Any] | tuple[dict[str, Any], HTTPStatus]:
+    """Delete an alias mapping."""
+    logger.info(f"Deleting alias: {request.alias}")
+
+    try:
+        table = get_dynamodb_table()
+        alias_key = f"alias#{request.alias}"
+
+        # Check if alias exists
+        alias_response = table.get_item(Key={"canonical_key": alias_key})
+        if "Item" not in alias_response:
+            logger.warning(f"Alias not found: {request.alias}")
+            metrics.add_metric(
+                name="AliasDeletionFailed",
+                unit=MetricUnit.Count,
+                value=1,
+            )
+            return {
+                "error": "Alias not found",
+                "details": f"The alias '{request.alias}' does not exist.",
+            }, HTTPStatus.NOT_FOUND
+
+        # Delete the alias
+        table.delete_item(Key={"canonical_key": alias_key})
+
+        logger.info(f"Successfully deleted alias: {request.alias}")
+        metrics.add_metric(name="AliasDeleted", unit=MetricUnit.Count, value=1)
+
+        response = DeleteAliasResponse(
+            message=f"Alias '{request.alias}' successfully deleted",
+            alias=request.alias,
+        )
+        return response.model_dump()
+
+    except Exception:
+        logger.exception("Error deleting alias")
+        metrics.add_metric(name="AliasDeletionErrors", unit=MetricUnit.Count, value=1)
+        raise
+
+
+@app.get("/aliases")
+@tracer.capture_method
+def list_aliases() -> dict[str, Any]:
+    """List all alias mappings."""
+    logger.info("Listing all aliases")
+
+    try:
+        table = get_dynamodb_table()
+
+        response = table.scan(
+            FilterExpression="begins_with(canonical_key, :prefix)",
+            ExpressionAttributeValues={":prefix": "alias#"},
+        )
+
+        aliases = []
+        for item in response.get("Items", []):
+            alias_name = item["canonical_key"].replace("alias#", "", 1)
+            aliases.append(
+                {
+                    "alias": alias_name,
+                    "canonical_key": item.get("maps_to", ""),
+                },
+            )
+
+        logger.info(f"Found {len(aliases)} aliases")
+        metrics.add_metric(name="AliasesListed", unit=MetricUnit.Count, value=1)
+
+        response = ListAliasesResponse(
+            aliases=aliases,
+            count=len(aliases),
+        )
+        return response.model_dump()
+
+    except Exception:
+        logger.exception("Error listing aliases")
+        metrics.add_metric(name="AliasListingErrors", unit=MetricUnit.Count, value=1)
         raise
 
 
