@@ -12,6 +12,7 @@ class AzureOpenAISettings(BaseSettings):
     endpoint: str = "https://uksouth.api.cognitive.microsoft.com/"
     embedding_model: str = "text-embedding-3-large"
     dimensions: int = 3072
+    deployment: str = "text-embedding-3-large"
 
 
 class MeilisearchSettings(BaseSettings):

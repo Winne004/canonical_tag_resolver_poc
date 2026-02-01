@@ -50,6 +50,10 @@ class ResolveRequest(BaseModel):
     k: int = Field(
         default=5, ge=1, le=100, description="Number of suggestions to return"
     )
+    enable_llm_review: bool = Field(
+        default=False,
+        description="Enable LLM review to determine if tags can be auto-merged",
+    )
 
     @field_validator("query")
     @classmethod
@@ -66,6 +70,9 @@ class CanonicalKeySuggestion(BaseModel):
     canonical_key: str
     similarity_score: float = Field(..., ge=0.0, le=1.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    llm_review: dict[str, Any] | None = Field(
+        default=None, description="LLM review decision for auto-merge vs human review"
+    )
 
 
 class ResolveResponseExact(BaseModel):

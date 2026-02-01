@@ -10,7 +10,9 @@ from aws_lambda_powertools.metrics import MetricUnit
 from aws_lambda_powertools.utilities.typing import LambdaContext
 from botocore.exceptions import ClientError
 from langchain_community.vectorstores import Meilisearch
-from langchain_openai import AzureOpenAIEmbeddings
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from meilisearch import Client as MeiliClient
 
 from models import (
@@ -89,17 +91,133 @@ def get_embeddings() -> AzureOpenAIEmbeddings:
 
 
 @lru_cache(maxsize=1)
+def get_chat_model() -> AzureChatOpenAI:
+    """Get or create Azure OpenAI chat model (cached)."""
+    azure_settings = get_azure_settings()
+    return AzureChatOpenAI(
+        azure_deployment=azure_settings.llm_deployment,  # You may want to add this to settings
+        azure_endpoint=azure_settings.endpoint,
+        api_key=azure_settings.azure_open_ai_api_key,
+        api_version="2024-02-15-preview",
+        temperature=0,
+    )
+
+
+@lru_cache(maxsize=1)
 def get_vector_store() -> Meilisearch:
-    """Get or create Meilisearch vector store (cached)."""
+    """Get or create Meilisearch vector store (cached).
+
+    This creates the vector store once with embedders config.
+    The embedders will be set only on first initialization.
+    """
     meili_settings = get_meili_settings()
     meili_client = get_meili_client()
     embeddings = get_embeddings()
+    azure_settings = get_azure_settings()
+
+    embedders = {
+        azure_settings.embedding_model: {
+            "source": "userProvided",
+            "dimensions": azure_settings.dimensions,
+        },
+    }
 
     return Meilisearch(
         client=meili_client,
         index_name=meili_settings.index_name,
         embedding=embeddings,
+        embedders=embedders,
     )
+
+
+def review_tag_merge_with_llm(
+    query_tag: str,
+    canonical_tag: str,
+    similarity_score: float,
+) -> dict[str, Any]:
+    """Use LLM to review if a tag can be automatically merged or requires human review.
+
+    Args:
+        query_tag: The original query tag
+        canonical_tag: The suggested canonical tag
+        similarity_score: The semantic similarity score
+
+    Returns:
+        Dictionary with review decision including:
+        - can_auto_merge: bool indicating if auto-merge is recommended
+        - confidence: str (high/medium/low)
+        - reasoning: str explaining the decision
+        - requires_human_review: bool
+
+    """
+    try:
+        llm = get_chat_model()
+
+        parser = JsonOutputParser()
+
+        prompt_template = PromptTemplate(
+            template="""You are a tag management expert. Review if the following tags can be automatically merged.
+
+Query Tag: "{query_tag}"
+Canonical Tag: "{canonical_tag}"
+Semantic Similarity Score: {similarity_score}
+
+Analyze if these tags can be automatically merged based on:
+1. Semantic equivalence (are they truly the same concept?)
+2. Similarity score (higher = more confident)
+3. Risk of incorrect merging
+
+Guidelines:
+
+- AUTO_MERGE with HIGH confidence if similarity >= 0.8 and tags are very similar
+- HUMAN_REVIEW if similarity < 0.80 or there's any ambiguity
+- HUMAN_REVIEW with LOW confidence if tags might have different meanings
+
+ignore case sensitivity or minor variations
+
+{format_instructions}
+
+Provide your response as a JSON object with these fields:
+- decision: "AUTO_MERGE" or "HUMAN_REVIEW"
+- confidence: "high", "medium", or "low"
+- reasoning: Brief explanation of your decision""",
+            input_variables=["query_tag", "canonical_tag", "similarity_score"],
+            partial_variables={"format_instructions": parser.get_format_instructions()},
+        )
+
+        chain = prompt_template | llm | parser
+
+        result = chain.invoke(
+            {
+                "query_tag": query_tag.lower().strip(),
+                "canonical_tag": canonical_tag.lower().strip(),
+                "similarity_score": f"{similarity_score:.3f}",
+            },
+        )
+
+        decision = result.get("decision", "HUMAN_REVIEW")
+        confidence = result.get("confidence", "low").lower()
+        reasoning = result.get("reasoning", "No reasoning provided")
+        can_auto_merge = decision == "AUTO_MERGE"
+
+        return {
+            "can_auto_merge": can_auto_merge,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "requires_human_review": not can_auto_merge,
+            "similarity_score": similarity_score,
+        }
+
+    except Exception as e:
+        logger.warning(f"LLM review failed: {e}")
+
+        return {
+            "can_auto_merge": False,
+            "confidence": "low",
+            "reasoning": f"LLM review failed: {e!s}",
+            "requires_human_review": True,
+            "similarity_score": similarity_score,
+        }
 
 
 @app.post("/search")
@@ -181,14 +299,33 @@ def resolve_canonical_key(request: ResolveRequest) -> dict[str, Any]:
             embedder_name=azure_settings.embedding_model,
         )
 
-        suggestions = [
-            CanonicalKeySuggestion(
-                canonical_key=doc.page_content,
-                similarity_score=float(score),
-                metadata=doc.metadata,
+        suggestions = []
+        for doc, score in search_results:
+            llm_review = None
+
+            if request.enable_llm_review:
+                logger.info(
+                    f"Performing LLM review for '{request.query}' -> '{doc.page_content}'",
+                )
+                llm_review = review_tag_merge_with_llm(
+                    query_tag=request.query,
+                    canonical_tag=doc.page_content,
+                    similarity_score=float(score),
+                )
+                metrics.add_metric(
+                    name="LLMReviewsPerformed",
+                    unit=MetricUnit.Count,
+                    value=1,
+                )
+
+            suggestions.append(
+                CanonicalKeySuggestion(
+                    canonical_key=doc.page_content,
+                    similarity_score=float(score),
+                    metadata=doc.metadata,
+                    llm_review=llm_review,
+                ),
             )
-            for doc, score in search_results
-        ]
 
         response = ResolveResponseSuggestions(
             query=request.query,
@@ -219,15 +356,7 @@ def ingest_topics(request: IngestRequest) -> dict[str, Any]:
     logger.info(f"Ingesting {len(request.topics)} topics into index and DynamoDB")
 
     try:
-        azure_settings = get_azure_settings()
         table = get_dynamodb_table()
-
-        embedders = {
-            f"{azure_settings.embedding_model}": {
-                "source": "userProvided",
-                "dimensions": azure_settings.dimensions,
-            },
-        }
 
         with table.batch_writer() as batch:
             for topic in request.topics:

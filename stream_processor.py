@@ -57,6 +57,79 @@ def get_embeddings() -> AzureOpenAIEmbeddings:
     )
 
 
+@lru_cache(maxsize=1)
+def get_vector_store() -> Meilisearch:
+    """Get or create Meilisearch vector store (cached).
+
+    This creates the vector store once with embedders config.
+    The embedders will be set only on first initialization.
+    """
+    meili_settings = get_meili_settings()
+    meili_client = get_meili_client()
+    embeddings = get_embeddings()
+    azure_settings = get_azure_settings()
+
+    embedders = {
+        azure_settings.embedding_model: {
+            "source": "userProvided",
+            "dimensions": azure_settings.dimensions,
+        },
+    }
+
+    return Meilisearch(
+        client=meili_client,
+        index_name=meili_settings.index_name,
+        embedding=embeddings,
+        embedders=embedders,
+    )
+
+
+def get_embedders_config() -> dict[str, Any]:
+    """Get embedders configuration for Meilisearch."""
+    azure_settings = get_azure_settings()
+    return {
+        azure_settings.embedding_model: {
+            "source": "userProvided",
+            "dimensions": azure_settings.dimensions,
+        },
+    }
+
+
+def add_to_vector_store(canonical_key: str) -> None:
+    """Add a canonical key to the vector store.
+
+    Uses cached vector store to avoid updating index settings on every call.
+    """
+    azure_settings = get_azure_settings()
+    vector_store = get_vector_store()
+
+    # Use add_texts instead of from_texts to avoid recreating the vector store
+    # and calling update_embedders() on every document add
+    vector_store.add_texts(
+        texts=[canonical_key],
+        embedder_name=azure_settings.embedding_model,
+    )
+
+
+def delete_from_vector_store(canonical_key: str) -> bool:
+    """Delete a canonical key from the vector store.
+
+    Returns:
+        True if deleted successfully, False if not found.
+    """
+    meili_settings = get_meili_settings()
+    meili_client = get_meili_client()
+    index = meili_client.index(meili_settings.index_name)
+
+    search_results = index.search(canonical_key, limit=1)
+    if search_results.get("hits"):
+        doc_id = search_results["hits"][0]["id"]
+        index.delete_document(doc_id)
+        logger.info(f"Deleted key from vector store: {canonical_key}")
+        return True
+    return False
+
+
 @logger.inject_lambda_context
 @tracer.capture_lambda_handler
 @metrics.log_metrics(capture_cold_start_metric=True)
@@ -67,11 +140,6 @@ def lambda_handler(
     """Lambda handler for processing DynamoDB stream events to sync with vector store."""
     records = list(event.records)
     logger.info("Processing %d DynamoDB stream records", len(records))
-
-    azure_settings = get_azure_settings()
-    meili_settings = get_meili_settings()
-    meili_client = get_meili_client()
-    embeddings = get_embeddings()
 
     processed = 0
     errors = 0
@@ -89,23 +157,7 @@ def lambda_handler(
                 canonical_key = new_image["canonical_key"]
 
                 logger.info(f"Adding canonical key to vector store: {canonical_key}")
-
-                embedders = {
-                    azure_settings.embedding_model: {
-                        "source": "userProvided",
-                        "dimensions": azure_settings.dimensions,
-                    },
-                }
-
-                Meilisearch.from_texts(
-                    client=meili_client,
-                    index_name=meili_settings.index_name,
-                    texts=[canonical_key],
-                    embedding=embeddings,
-                    embedders=embedders,
-                    embedder_name=azure_settings.embedding_model,
-                )
-
+                add_to_vector_store(canonical_key)
                 metrics.add_metric(
                     name="VectorStoreInsert",
                     unit=MetricUnit.Count,
@@ -124,30 +176,8 @@ def lambda_handler(
 
                 if old_key != new_key:
                     logger.info(f"Updating canonical key: {old_key} -> {new_key}")
-
-                    index = meili_client.index(meili_settings.index_name)
-                    search_results = index.search(old_key, limit=1)
-                    if search_results.get("hits"):
-                        doc_id = search_results["hits"][0]["id"]
-                        index.delete_document(doc_id)
-                        logger.info(f"Deleted old key from vector store: {old_key}")
-
-                    embedders = {
-                        azure_settings.embedding_model: {
-                            "source": "userProvided",
-                            "dimensions": azure_settings.dimensions,
-                        },
-                    }
-
-                    Meilisearch.from_texts(
-                        client=meili_client,
-                        index_name=meili_settings.index_name,
-                        texts=[new_key],
-                        embedding=embeddings,
-                        embedders=embedders,
-                        embedder_name=azure_settings.embedding_model,
-                    )
-
+                    delete_from_vector_store(old_key)
+                    add_to_vector_store(new_key)
                     metrics.add_metric(
                         name="VectorStoreUpdate",
                         unit=MetricUnit.Count,
@@ -169,13 +199,7 @@ def lambda_handler(
                 logger.info(
                     f"Removing canonical key from vector store: {canonical_key}",
                 )
-
-                index = meili_client.index(meili_settings.index_name)
-                search_results = index.search(canonical_key, limit=1)
-                if search_results.get("hits"):
-                    doc_id = search_results["hits"][0]["id"]
-                    index.delete_document(doc_id)
-                    logger.info(f"Deleted key from vector store: {canonical_key}")
+                if delete_from_vector_store(canonical_key):
                     metrics.add_metric(
                         name="VectorStoreDelete",
                         unit=MetricUnit.Count,
