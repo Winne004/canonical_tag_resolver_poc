@@ -13,6 +13,6 @@ COPY ./pyproject.toml ./uv.lock ./
 RUN uv export --frozen --no-emit-workspace --no-dev --no-editable -o requirements.txt && \
     uv pip install -r requirements.txt --target "${LAMBDA_TASK_ROOT}"
 
-COPY ./api.py  ./models.py ./settings.py ./
+COPY ./src/api.py  ./src/models.py ./src/settings.py ./src/shared.py ./src/
 
-CMD ["api.lambda_handler"]
+CMD ["src.api.lambda_handler"]

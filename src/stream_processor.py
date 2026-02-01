@@ -1,5 +1,4 @@
 import json
-from functools import lru_cache
 from typing import Any
 
 from aws_lambda_powertools import Logger, Metrics, Tracer
@@ -12,87 +11,18 @@ from aws_lambda_powertools.utilities.data_classes.dynamo_db_stream_event import 
     DynamoDBRecordEventName,
 )
 from aws_lambda_powertools.utilities.typing import LambdaContext
-from langchain_community.vectorstores import Meilisearch
-from langchain_openai import AzureOpenAIEmbeddings
-from meilisearch import Client as MeiliClient
 
-from settings import AzureOpenAISettings, MeilisearchSettings
+from src.shared import (
+    get_azure_settings,
+    get_meili_client,
+    get_meili_settings,
+    get_vector_store,
+)
 
 # Initialize Powertools
 logger = Logger()
 tracer = Tracer()
 metrics = Metrics()
-
-
-@lru_cache(maxsize=1)
-def get_azure_settings() -> AzureOpenAISettings:
-    """Get or create Azure OpenAI settings (cached)."""
-    return AzureOpenAISettings()  # pyright: ignore[reportCallIssue]
-
-
-@lru_cache(maxsize=1)
-def get_meili_settings() -> MeilisearchSettings:
-    """Get or create Meilisearch settings (cached)."""
-    return MeilisearchSettings()  # pyright: ignore[reportCallIssue]
-
-
-@lru_cache(maxsize=1)
-def get_meili_client() -> MeiliClient:
-    """Get or create Meilisearch client (cached)."""
-    meili_settings = get_meili_settings()
-    return MeiliClient(
-        meili_settings.meili_url,
-        meili_settings.meli_master_key.get_secret_value(),
-    )
-
-
-@lru_cache(maxsize=1)
-def get_embeddings() -> AzureOpenAIEmbeddings:
-    """Get or create Azure OpenAI embeddings (cached)."""
-    azure_settings = get_azure_settings()
-    return AzureOpenAIEmbeddings(
-        model=azure_settings.embedding_model,
-        azure_endpoint=azure_settings.endpoint,
-        api_key=azure_settings.azure_open_ai_api_key,
-    )
-
-
-@lru_cache(maxsize=1)
-def get_vector_store() -> Meilisearch:
-    """Get or create Meilisearch vector store (cached).
-
-    This creates the vector store once with embedders config.
-    The embedders will be set only on first initialization.
-    """
-    meili_settings = get_meili_settings()
-    meili_client = get_meili_client()
-    embeddings = get_embeddings()
-    azure_settings = get_azure_settings()
-
-    embedders = {
-        azure_settings.embedding_model: {
-            "source": "userProvided",
-            "dimensions": azure_settings.dimensions,
-        },
-    }
-
-    return Meilisearch(
-        client=meili_client,
-        index_name=meili_settings.index_name,
-        embedding=embeddings,
-        embedders=embedders,
-    )
-
-
-def get_embedders_config() -> dict[str, Any]:
-    """Get embedders configuration for Meilisearch."""
-    azure_settings = get_azure_settings()
-    return {
-        azure_settings.embedding_model: {
-            "source": "userProvided",
-            "dimensions": azure_settings.dimensions,
-        },
-    }
 
 
 def add_to_vector_store(canonical_key: str) -> None:
@@ -116,6 +46,7 @@ def delete_from_vector_store(canonical_key: str) -> bool:
 
     Returns:
         True if deleted successfully, False if not found.
+
     """
     meili_settings = get_meili_settings()
     meili_client = get_meili_client()
@@ -135,7 +66,8 @@ def delete_from_vector_store(canonical_key: str) -> bool:
 @metrics.log_metrics(capture_cold_start_metric=True)
 @event_source(data_class=DynamoDBStreamEvent)
 def lambda_handler(
-    event: DynamoDBStreamEvent, context: LambdaContext
+    event: DynamoDBStreamEvent,
+    context: LambdaContext,
 ) -> dict[str, Any]:
     """Lambda handler for processing DynamoDB stream events to sync with vector store."""
     records = list(event.records)
