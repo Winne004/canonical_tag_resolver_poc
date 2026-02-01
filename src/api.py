@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 from functools import lru_cache
 from http import HTTPStatus
@@ -497,12 +498,7 @@ def create_alias(
                 "maps_to": request.canonical_key,
                 "metadata": {
                     "type": "alias",
-                    "created_at": str(
-                        boto3.Session()
-                        .client("sts")
-                        .get_caller_identity()
-                        .get("Account"),
-                    ),
+                    "created_at": datetime.now(UTC).isoformat(),
                 },
             },
         )
