@@ -85,6 +85,30 @@ Resources:
             RestApiId: !Ref CanonicalTagResolverApi
             Path: /ingest
             Method: POST
+        CreateAliasApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CanonicalTagResolverApi
+            Path: /aliases
+            Method: POST
+        BulkCreateAliasApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CanonicalTagResolverApi
+            Path: /aliases/bulk
+            Method: POST
+        DeleteAliasApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CanonicalTagResolverApi
+            Path: /aliases
+            Method: DELETE
+        ListAliasesApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CanonicalTagResolverApi
+            Path: /aliases
+            Method: GET
         swaggerUi:
           Type: Api
           Properties:

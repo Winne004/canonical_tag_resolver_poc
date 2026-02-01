@@ -33,8 +33,6 @@ def add_to_vector_store(canonical_key: str) -> None:
     azure_settings = get_azure_settings()
     vector_store = get_vector_store()
 
-    # Use add_texts instead of from_texts to avoid recreating the vector store
-    # and calling update_embedders() on every document add
     vector_store.add_texts(
         texts=[canonical_key],
         embedder_name=azure_settings.embedding_model,
@@ -88,6 +86,11 @@ def lambda_handler(
                 new_image = record.dynamodb.new_image
                 canonical_key = new_image["canonical_key"]
 
+                if canonical_key.startswith("alias#"):
+                    logger.info(f"Skipping alias from vector store: {canonical_key}")
+                    processed += 1
+                    continue
+
                 logger.info(f"Adding canonical key to vector store: {canonical_key}")
                 add_to_vector_store(canonical_key)
                 metrics.add_metric(
@@ -105,6 +108,13 @@ def lambda_handler(
                 new_image = record.dynamodb.new_image
                 old_key = old_image["canonical_key"]
                 new_key = new_image["canonical_key"]
+
+                if old_key.startswith("alias#") or new_key.startswith("alias#"):
+                    logger.info(
+                        f"Skipping alias from vector store: {old_key} -> {new_key}"
+                    )
+                    processed += 1
+                    continue
 
                 if old_key != new_key:
                     logger.info(f"Updating canonical key: {old_key} -> {new_key}")
@@ -127,6 +137,13 @@ def lambda_handler(
                     continue
                 old_image = record.dynamodb.old_image
                 canonical_key = old_image["canonical_key"]
+
+                if canonical_key.startswith("alias#"):
+                    logger.info(
+                        f"Skipping alias removal from vector store: {canonical_key}"
+                    )
+                    processed += 1
+                    continue
 
                 logger.info(
                     f"Removing canonical key from vector store: {canonical_key}",
